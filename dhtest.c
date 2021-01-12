@@ -94,6 +94,8 @@ struct dhcpv4_hdr *dhcph_g = { 0 };
 u_int8_t *dhopt_pointer_g = { 0 };
 u_int8_t verbose = 0;
 u_int8_t dhcp_release_flag = 0;
+u_int8_t dhcp_renew_flag = 0;
+u_int8_t exit_on_nack_flag = 0;
 u_int8_t padding_flag = 0;
 u_int16_t timeout = 0;
 time_t time_now, time_last;
@@ -190,12 +192,14 @@ int main(int argc, char *argv[])
 		{ "release", no_argument, 0, 'r'},
 		{ "json", no_argument, 0, 'j'},
 		{ "decline", no_argument, 0, 'D'},
+		{ "renew", no_argument, 0, 'w'},
+		{ "exit-on-nack", no_argument, 0, 'e'},
 		{ 0, 0, 0, 0 }
 	};
 
 	/*getopt routine to get command line arguments*/
 	while(get_tmp < argc) {
-		get_cmd  = getopt_long(argc, argv, "m:R:i:v:t:bfVrpanNsjDu::T:P:g:S:I:o:k:L:l:h:d:c:",\
+		get_cmd  = getopt_long(argc, argv, "m:R:i:v:t:bfVrpanNsjDu::T:P:g:S:I:o:k:L:l:h:d:c:we",\
 				long_options, &option_index);
 		if(get_cmd == -1 ) {
 			break;
@@ -514,6 +518,14 @@ int main(int argc, char *argv[])
 				dhcp_decline_flag = 1;
 				break;
 
+			case 'w':
+				dhcp_renew_flag = 1;
+				break;
+
+			case 'e':
+                                exit_on_nack_flag = 1;
+				break;
+
 			default:
 				exit(2);
 		}
@@ -685,92 +697,95 @@ int main(int argc, char *argv[])
 	if(timeout) {
 		time_last = time(NULL);
 	}
-	build_option53(DHCP_MSGDISCOVER);	/* Option53 for DHCP discover */
-	if(hostname_flag) {
-		build_option12_hostname();
-	}
-	if(fqdn_flag) {
-		build_option81_fqdn();
-	}
-	if(option50_ip) {
-		build_option50();		/* Option50 - req. IP  */
-	}
-        build_option55();                       /* Option55 - parameter request list */
-	if(option51_lease_time) {
-		build_option51();               /* Option51 - DHCP lease time requested */
-	}
 
-	if(vci_flag) {
-		build_option60_vci(); 		/* Option60 - VCI  */
-	}
-        /* Build custom options */
-        if(no_custom_dhcp_options) {
-            build_custom_dhcp_options();
+	if(!dhcp_renew_flag) {
+            build_option53(DHCP_MSGDISCOVER);	/* Option53 for DHCP discover */
+            if(hostname_flag) {
+                    build_option12_hostname();
+            }
+            if(fqdn_flag) {
+                    build_option81_fqdn();
+            }
+            if(option50_ip) {
+                    build_option50();		/* Option50 - req. IP  */
+            }
+            build_option55();                       /* Option55 - parameter request list */
+            if(option51_lease_time) {
+                    build_option51();               /* Option51 - DHCP lease time requested */
+            }
+
+            if(vci_flag) {
+                    build_option60_vci(); 		/* Option60 - VCI  */
+            }
+            /* Build custom options */
+            if(no_custom_dhcp_options) {
+                build_custom_dhcp_options();
+            }
+            build_optioneof();			/* End of option */
+            build_dhpacket(DHCP_MSGDISCOVER);	/* Build DHCP discover packet */
+
+            int dhcp_offer_state = 0;
+            while(dhcp_offer_state != DHCP_OFFR_RCVD) {
+
+                    /* Sends DHCP discover packet */
+                    send_packet(DHCP_MSGDISCOVER);
+                    /*
+                     * recv_packet functions returns when the specified
+                     * packet is received
+                     */
+                    dhcp_offer_state = recv_packet(DHCP_MSGOFFER);
+
+                    if(timeout) {
+                            time_now = time(NULL);
+                            if((time_now - time_last) >= timeout) {
+                                    if (nagios_flag) {
+                                            fprintf(stdout, "CRITICAL: Timeout reached: DISCOVER.");
+                                    } else if(json_flag) {
+                                            if(!json_first) {
+                                                    fprintf(stdout, ",");
+                                            } else {
+                                                    json_first = 0;
+                                            }
+
+                                            fprintf(stdout, "{\"msg\":\"Timeout reached: DISCOVER.\","
+                                                    "\"result\":\"error\","
+                                                    "\"error-type\":\"timeout\","
+                                                    "\"error-subtype\":\"DISCOVER\","
+                                                    "\"error-msg\":\"Timeout reached: DISCOVER.\"}"
+                                                    "]");
+                                    }
+
+                                    close_socket();
+                                    exit(2);
+                            }
+                    }
+                    if(dhcp_offer_state == DHCP_OFFR_RCVD) {
+                            if (!nagios_flag && !json_flag) {
+                                    fprintf(stdout, "DHCP offer received\t - ");
+                            } else if(!nagios_flag) {
+                                    if(!json_first) {
+                                            fprintf(stdout, ",");
+                                    } else {
+                                            json_first = 0;
+                                    }
+
+                                    fprintf(stdout, "{\"msg\":\"DHCP offer received - %s\","
+                                                    "\"result\":\"success\","
+                                                    "\"result-type\":\"OFFER\","
+                                                    "\"result-value\":\"%s\""
+                                                    "}",
+                                            get_ip_str(dhcph_g->dhcp_yip), get_ip_str(dhcph_g->dhcp_yip));
+                            }
+
+                            set_serv_id_opt50();
+                            if (!nagios_flag && !json_flag)
+                                    fprintf(stdout, "Offered IP : %s\n", get_ip_str(dhcph_g->dhcp_yip));
+                            if(!nagios_flag && verbose) {
+                                    print_dhinfo(DHCP_MSGOFFER);
+                            }
+                    }
+            }
         }
-	build_optioneof();			/* End of option */
-	build_dhpacket(DHCP_MSGDISCOVER);	/* Build DHCP discover packet */
-
-	int dhcp_offer_state = 0;
-	while(dhcp_offer_state != DHCP_OFFR_RCVD) {
-
-		/* Sends DHCP discover packet */
-		send_packet(DHCP_MSGDISCOVER);
-		/*
-		 * recv_packet functions returns when the specified
-		 * packet is received
-		 */
-		dhcp_offer_state = recv_packet(DHCP_MSGOFFER);
-
-		if(timeout) {
-			time_now = time(NULL);
-			if((time_now - time_last) >= timeout) {
-				if (nagios_flag) {
-					fprintf(stdout, "CRITICAL: Timeout reached: DISCOVER.");
-				} else if(json_flag) {
-					if(!json_first) {
-						fprintf(stdout, ",");
-					} else {
-						json_first = 0;
-					}
-
-					fprintf(stdout, "{\"msg\":\"Timeout reached: DISCOVER.\","
-                                                "\"result\":\"error\","
-                                                "\"error-type\":\"timeout\","
-                                                "\"error-subtype\":\"DISCOVER\","
-                                                "\"error-msg\":\"Timeout reached: DISCOVER.\"}"
-						"]");
-				}
-
-				close_socket();
-				exit(2);
-			}
-		}
-		if(dhcp_offer_state == DHCP_OFFR_RCVD) {
-			if (!nagios_flag && !json_flag) {
-				fprintf(stdout, "DHCP offer received\t - ");
-			} else if(!nagios_flag) {
-				if(!json_first) {
-					fprintf(stdout, ",");
-				} else {
-					json_first = 0;
-				}
-
-				fprintf(stdout, "{\"msg\":\"DHCP offer received - %s\","
-						"\"result\":\"success\","
-						"\"result-type\":\"OFFER\","
-						"\"result-value\":\"%s\""
-						"}",
-					get_ip_str(dhcph_g->dhcp_yip), get_ip_str(dhcph_g->dhcp_yip));
-			}
-
-			set_serv_id_opt50();
-			if (!nagios_flag && !json_flag)
-  				fprintf(stdout, "Offered IP : %s\n", get_ip_str(dhcph_g->dhcp_yip));
-			if(!nagios_flag && verbose) {
-				print_dhinfo(DHCP_MSGOFFER);
-			}
-		}
-	}
 	/* Reset the dhopt buffer to build DHCP request options  */
 	reset_dhopt_size();
 	build_option53(DHCP_MSGREQUEST);
@@ -872,6 +887,11 @@ int main(int argc, char *argv[])
 						"}",
 						dhmac[0], dhmac[1], dhmac[2], dhmac[3], dhmac[4], dhmac[5]);
 			}
+                        if(exit_on_nack_flag) {
+                            clear_promisc();		 /* Clear the promiscuous mode */
+                            close_socket();
+                            return 0;
+                        }
 		}
 	}
 	/* If IP listen flag is enabled, Listen on obtained for ARP, ICMP protocols  */
